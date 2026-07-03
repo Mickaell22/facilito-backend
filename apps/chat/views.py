@@ -74,6 +74,12 @@ class ChatAudioView(APIView):
             respuesta = services._format_for_flutter(propuesta)
             respuesta['transcripcion'] = texto
             return Response(respuesta)
+        except services.ChatError as e:
+            logger.warning('ChatError en ChatAudioView: %s', e)
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         except Exception:
             logger.exception('Error en ChatAudioView')
             return Response(
@@ -106,6 +112,12 @@ class ChatFotoView(APIView):
         try:
             propuesta = services.procesar_foto(foto, request.user.negocio)
             return Response(services._format_for_flutter(propuesta))
+        except services.ChatError as e:
+            logger.warning('ChatError en ChatFotoView: %s', e)
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         except Exception:
             logger.exception('Error en ChatFotoView')
             return Response(

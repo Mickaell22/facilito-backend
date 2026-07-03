@@ -21,6 +21,9 @@ python manage.py seed
 # Verificar configuración
 python manage.py check
 
+# Tests (lógica pura del chat: parseo LLM y validación de entrada)
+python manage.py test apps.chat
+
 # Crear superusuario para el admin
 python manage.py createsuperuser
 ```
@@ -109,7 +112,7 @@ Negocio
 
 Flujo: texto/audio/foto → propuesta JSON → usuario confirma → `confirmar_accion()` escribe a BD.
 
-- **LLM (texto):** DeepSeek `deepseek-chat` vía API compatible OpenAI, llamada directa con `httpx` (no el SDK de OpenAI, que daba conflicto de versión `proxies`) — timeout 30s. **Temporal, para pruebas.** Requiere `DEEPSEEK_API_KEY`.
+- **LLM (texto):** DeepSeek `deepseek-chat` vía API compatible OpenAI, llamada directa con `httpx` (no el SDK de OpenAI, que daba conflicto de versión `proxies`) — timeout 30s, `max_tokens=1024` y modo JSON nativo (`response_format={'type':'json_object'}`). **Temporal, para pruebas.** Requiere `DEEPSEEK_API_KEY`.
 - **Audio:** Whisper (`whisper-1`) vía OpenAI SDK — timeout 60s. Requiere `OPENAI_API_KEY` (no configurada en Railway).
 - **Foto:** Claude Haiku con visión (imagen en base64) vía Anthropic SDK — timeout 30s. Requiere `ANTHROPIC_API_KEY` (no configurada). DeepSeek no tiene visión.
 - **El LLM nunca escribe directamente a la BD** — siempre pasa por `/api/chat/confirmar/`
@@ -121,12 +124,29 @@ Acciones que puede proponer el LLM: `registrar_movimiento`, `crear_producto`, `c
 
 Todas las vistas del chat (`ChatMensajeView`, `ChatAudioView`, `ChatFotoView`, `ChatConfirmarView`) tienen `throttle_classes = [ChatRateThrottle]`.
 
+**Validación en `confirmar_accion` (límite de confianza):** el body de
+`/api/chat/confirmar/` viene del cliente, así que los handlers validan todo y
+lanzan `ValueError` (→ 400) en vez de reventar con 500: `datos` debe ser dict,
+`tipo` ∈ {entrada, salida}, cantidades > 0 (una "entrada" con cantidad negativa
+descontaría stock saltándose el chequeo de stock insuficiente), decimales vía
+`_a_decimal()` (convierte `None`/texto inválido en `ValueError`, no en
+`InvalidOperation`), `precio_venta` se compara con `is not None` (0 es válido),
+y los `None` en actualizar_producto se ignoran. Cubierto por `apps/chat/tests.py`.
+
+**Guardas de API keys:** `procesar_mensaje` / `transcribir_audio` /
+`procesar_foto` lanzan `ChatError` si falta su API key, y las tres vistas
+(mensaje, audio, foto) devuelven `ChatError` como **503** con el mensaje — sin
+clave configurada el cliente recibe "no está disponible todavía" en vez de un
+500 opaco.
+
+**Robustez del chat de texto:** `procesar_mensaje` usa el modo JSON nativo de DeepSeek y envuelve los fallos de red en `ChatError` (timeout, HTTP 4xx/5xx, conexión) con un mensaje seguro; `ChatMensajeView` los devuelve como **503** con ese mensaje y deja el `except Exception` genérico como 500. `_parse_llm_response` es tolerante: quita los fences de markdown, intenta `json.loads` y, si falla, extrae el primer bloque `{...}` (regex DOTALL); si no hay JSON válido lanza `ChatError`. Es compartido con `procesar_foto`, donde Claude a veces envuelve el JSON en markdown. El prompt de acciones está alineado con los handlers (`proveedor` opcional en `crear_producto`; `nombre` editable en `actualizar_producto`).
+
 ### Autenticación y seguridad
 
 - JWT Bearer token en todos los endpoints excepto `registro/` y `login/`.
 - Access token: 8h. Refresh: 30d con rotación automática.
 - **Blacklist activa:** `BLACKLIST_AFTER_ROTATION=True` — los refresh tokens rotados quedan invalidados.
-- `CambiarPasswordView` invalida **todos** los refresh tokens activos del usuario al cambiar contraseña.
+- `CambiarPasswordView` invalida **todos** los refresh tokens activos del usuario al cambiar contraseña. Si el blacklisteo falla, la excepción **se propaga** (500) — decisión deliberada: no se reporta éxito mientras queden sesiones viejas válidas.
 - **Rate limiting:** anónimos 20/hora, usuarios 1000/día, chat 30/hora (`ChatRateThrottle`).
 - Password mínimo: **8 caracteres**.
 

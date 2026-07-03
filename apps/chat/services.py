@@ -2,7 +2,7 @@ import base64
 import json
 import re
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import httpx
 from anthropic import Anthropic
@@ -144,13 +144,18 @@ def _parse_llm_response(text):
     except json.JSONDecodeError:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
-            return json.loads(match.group(0))
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
         raise ChatError('No entendí la respuesta del asistente. Intenta reformular tu mensaje.')
 
 
 # ── Procesamiento de entrada ─────────────────────────────────────────────────
 
 def procesar_mensaje(texto, negocio):
+    if not settings.DEEPSEEK_API_KEY:
+        raise ChatError('El asistente de texto no está configurado en el servidor.')
     try:
         response = httpx.post(
             DEEPSEEK_URL,
@@ -179,6 +184,8 @@ def procesar_mensaje(texto, negocio):
 
 
 def transcribir_audio(audio_file):
+    if not settings.OPENAI_API_KEY:
+        raise ChatError('La transcripción de audio no está disponible todavía.')
     client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=60.0)
     transcript = client.audio.transcriptions.create(
         model='whisper-1',
@@ -189,6 +196,8 @@ def transcribir_audio(audio_file):
 
 
 def procesar_foto(imagen_file, negocio):
+    if not settings.ANTHROPIC_API_KEY:
+        raise ChatError('El análisis de fotos no está disponible todavía.')
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=30.0)
     image_data = base64.standard_b64encode(imagen_file.read()).decode('utf-8')
     media_type = imagen_file.content_type or 'image/jpeg'
@@ -222,7 +231,19 @@ def procesar_foto(imagen_file, negocio):
 
 # ── Búsquedas internas ───────────────────────────────────────────────────────
 
+def _a_decimal(valor, campo):
+    """Convierte input del cliente a Decimal; ValueError (→ 400) si es inválido."""
+    if valor is None:
+        raise ValueError(f'Falta el valor de "{campo}".')
+    try:
+        return Decimal(str(valor))
+    except InvalidOperation as e:
+        raise ValueError(f'El valor de "{campo}" no es un número válido.') from e
+
+
 def _buscar_producto(nombre, negocio):
+    if not nombre:
+        raise ValueError('Indica el nombre del producto.')
     qs = Producto.objects.for_tenant(negocio).filter(activo=True)
     try:
         return qs.get(nombre__iexact=nombre)
@@ -248,7 +269,9 @@ def _buscar_proveedor(nombre, negocio):
 
 def confirmar_accion(propuesta, negocio, usuario):
     accion = propuesta.get('accion')
-    datos = propuesta.get('datos', {})
+    datos = propuesta.get('datos')
+    if not isinstance(datos, dict):
+        raise ValueError('El campo "datos" debe ser un objeto con los datos de la acción.')
 
     handlers = {
         'registrar_movimiento': _confirmar_movimiento,
@@ -277,10 +300,14 @@ def _format_for_flutter(propuesta):
 
 
 def _confirmar_movimiento(datos, negocio, usuario):
-    producto = _buscar_producto(datos['producto'], negocio)
-    tipo = datos['tipo']
-    cantidad = Decimal(str(datos['cantidad']))
-    nota = datos.get('nota', '')
+    producto = _buscar_producto(datos.get('producto'), negocio)
+    tipo = datos.get('tipo')
+    if tipo not in ('entrada', 'salida'):
+        raise ValueError('El tipo de movimiento debe ser "entrada" o "salida".')
+    cantidad = _a_decimal(datos.get('cantidad'), 'cantidad')
+    if cantidad <= 0:
+        raise ValueError('La cantidad debe ser mayor que cero.')
+    nota = datos.get('nota') or ''
     motivo = datos.get('motivo', 'compra' if tipo == 'entrada' else 'consumo')
     delta = cantidad if tipo == 'entrada' else -cantidad
 
@@ -319,10 +346,13 @@ def _confirmar_crear_producto(datos, negocio):
         negocio=negocio,
         nombre=nombre,
         categoria=datos.get('categoria', 'insumo'),
-        costo=Decimal(str(datos.get('costo', 0))),
+        costo=_a_decimal(datos.get('costo') or 0, 'costo'),
         unidad=datos.get('unidad', 'unidad'),
-        stock_minimo=Decimal(str(datos.get('stock_minimo', 0))),
-        precio_venta=Decimal(str(datos['precio_venta'])) if datos.get('precio_venta') else None,
+        stock_minimo=_a_decimal(datos.get('stock_minimo') or 0, 'stock_minimo'),
+        precio_venta=(
+            _a_decimal(datos['precio_venta'], 'precio_venta')
+            if datos.get('precio_venta') is not None else None
+        ),
         proveedor=proveedor,
     )
     return {
@@ -340,9 +370,9 @@ def _confirmar_crear_proveedor(datos, negocio):
     proveedor = Proveedor.objects.create(
         negocio=negocio,
         nombre=nombre,
-        telefono=datos.get('telefono', ''),
-        email=datos.get('email', ''),
-        contacto=datos.get('contacto', ''),
+        telefono=datos.get('telefono') or '',
+        email=datos.get('email') or '',
+        contacto=datos.get('contacto') or '',
     )
     return {
         'ok': True,
@@ -353,14 +383,16 @@ def _confirmar_crear_proveedor(datos, negocio):
 
 
 def _confirmar_actualizar_producto(datos, negocio):
-    producto = _buscar_producto(datos['producto'], negocio)
+    producto = _buscar_producto(datos.get('producto'), negocio)
     campos_decimales = {'precio_venta', 'costo', 'stock_minimo'}
     campos_permitidos = campos_decimales | {'unidad', 'nombre'}
 
     for campo, valor in datos.items():
-        if campo == 'producto' or campo not in campos_permitidos:
+        if campo == 'producto' or campo not in campos_permitidos or valor is None:
             continue
-        setattr(producto, campo, Decimal(str(valor)) if campo in campos_decimales else valor)
+        if campo == 'nombre' and not str(valor).strip():
+            raise ValueError('El nombre del producto no puede quedar vacío.')
+        setattr(producto, campo, _a_decimal(valor, campo) if campo in campos_decimales else valor)
 
     producto.save()
     return {
@@ -372,19 +404,23 @@ def _confirmar_actualizar_producto(datos, negocio):
 
 
 def _confirmar_venta(datos, negocio, usuario):
-    detalles_data = datos.get('detalles', [])
-    if not detalles_data:
+    detalles_data = datos.get('detalles')
+    if not isinstance(detalles_data, list) or not detalles_data:
         raise ValueError('La venta requiere al menos un producto.')
+    if not all(isinstance(item, dict) for item in detalles_data):
+        raise ValueError('Cada detalle de la venta debe incluir producto y cantidad.')
 
     with transaction.atomic():
         total = Decimal('0')
         detalles_objs = []
 
         for item in detalles_data:
-            producto = _buscar_producto(item['producto'], negocio)
+            producto = _buscar_producto(item.get('producto'), negocio)
             if producto.precio_venta is None:
                 raise ValueError(f'"{producto.nombre}" no tiene precio de venta definido.')
-            cantidad = Decimal(str(item['cantidad']))
+            cantidad = _a_decimal(item.get('cantidad'), 'cantidad')
+            if cantidad <= 0:
+                raise ValueError('La cantidad de cada detalle debe ser mayor que cero.')
             subtotal = cantidad * producto.precio_venta
             total += subtotal
             detalles_objs.append(
@@ -400,7 +436,7 @@ def _confirmar_venta(datos, negocio, usuario):
             negocio=negocio,
             atendido_por=usuario,
             total=total,
-            nota=datos.get('nota', ''),
+            nota=datos.get('nota') or '',
         )
         for d in detalles_objs:
             d.venta = venta
